@@ -179,7 +179,6 @@ class LibraryBrowser(
                         imageTypeLimit = 1,
                         enableImageTypes = listOf(ImageType.PRIMARY),
                         enableTotalRecordCount = false,
-                        limit = 50,
                     ).content.extractItems()
                 }?.let { artistTracks ->
                     Timber.d("Got result, starting playback")
@@ -197,7 +196,6 @@ class LibraryBrowser(
             imageTypeLimit = 1,
             enableImageTypes = listOf(ImageType.PRIMARY),
             enableTotalRecordCount = false,
-            limit = 50,
         )
 
         return result.extractItems()
@@ -303,7 +301,6 @@ class LibraryBrowser(
             recursive = true,
             imageTypeLimit = 1,
             enableImageTypes = listOf(ImageType.PRIMARY),
-            limit = 400,
         )
 
         return result.extractItems()?.browsable()
@@ -317,7 +314,6 @@ class LibraryBrowser(
             recursive = true,
             imageTypeLimit = 1,
             enableImageTypes = listOf(ImageType.PRIMARY),
-            limit = 200,
         )
 
         return result.extractItems(libraryId.toString())?.browsable()
@@ -329,7 +325,6 @@ class LibraryBrowser(
             parentId = libraryId,
             imageTypeLimit = 1,
             enableImageTypes = listOf(ImageType.PRIMARY),
-            limit = 50,
         )
 
         return result.extractItems(libraryId.toString())?.browsable()
@@ -343,7 +338,6 @@ class LibraryBrowser(
             recursive = true,
             imageTypeLimit = 1,
             enableImageTypes = listOf(ImageType.PRIMARY),
-            limit = 50,
         )
 
         return result.extractItems()?.browsable()
