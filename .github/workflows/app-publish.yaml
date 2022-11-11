@@ -9,7 +9,6 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-22.04
-    if: ${{ contains(github.repository_owner, 'jellyfin') }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # tag=v3.1.0
@@ -24,29 +23,11 @@ jobs:
         run: echo "JELLYFIN_VERSION=$(echo ${GITHUB_REF#refs/tags/v} | tr / -)" >> $GITHUB_ENV
       - name: Assemble release files
         run: ./gradlew assemble bundleProprietaryRelease versionTxt
-      - name: Sign libre APK
-        id: libreSign
-        uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # tag=v1
-        with:
-          releaseDirectory: app/build/outputs/apk/libre/release
-          signingKeyBase64: ${{ secrets.KEYSTORE }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
       - name: Sign proprietary APK
         id: proprietarySign
         uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # tag=v1
         with:
           releaseDirectory: app/build/outputs/apk/proprietary/release
-          signingKeyBase64: ${{ secrets.KEYSTORE }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-      - name: Sign proprietary app bundle
-        id: proprietaryBundleSign
-        uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # tag=v1
-        with:
-          releaseDirectory: app/build/outputs/bundle/proprietaryRelease
           signingKeyBase64: ${{ secrets.KEYSTORE }}
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           alias: ${{ secrets.KEY_ALIAS }}
@@ -65,28 +46,6 @@ jobs:
       - name: Upload release archive to GitHub release
         uses: alexellis/upload-assets@259de5111cb56966d046ced998941e93f91d2c93 # tag=0.4.0
         env:
-          GITHUB_TOKEN: ${{ secrets.JF_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           asset_paths: '["build/jellyfin-publish/*"]'
-      - name: Upload release archive to repo.jellyfin.org
-        uses: burnett01/rsync-deployments@2651e3eecb4ea772cbe952695d04952e92027b4f # tag=5.2.1
-        with:
-          switches: -vrptz
-          path: build/jellyfin-publish/
-          remote_path: /srv/repository/releases/client/android/versions/v${{ env.JELLYFIN_VERSION }}
-          remote_host: ${{ secrets.DEPLOY_HOST }}
-          remote_user: ${{ secrets.DEPLOY_USER }}
-          remote_key: ${{ secrets.DEPLOY_KEY }}
-      - name: Update repo.jellyfin.org symlinks
-        uses: appleboy/ssh-action@f9010ff7f1bbd7db1a0b4bab661437550cea20c0 # tag=v0.1.5
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_KEY }}
-          envs: JELLYFIN_VERSION
-          script_stop: true
-          script: |
-            cd /srv/repository/releases/client/android;
-            rm -rf *.apk version.txt;
-            ln -s versions/v${JELLYFIN_VERSION}/jellyfin-android-v${JELLYFIN_VERSION}-*.apk .;
-            ln -s versions/v${JELLYFIN_VERSION}/version.txt .;
