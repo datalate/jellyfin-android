@@ -30,8 +30,8 @@ import org.jellyfin.sdk.api.client.ApiClient
 import org.jellyfin.sdk.api.client.extensions.videosApi
 import org.jellyfin.sdk.api.operations.VideosApi
 import org.jellyfin.sdk.model.api.DeviceProfile
-import org.jellyfin.sdk.model.api.MediaStream
 import org.jellyfin.sdk.model.api.PlayMethod
+import org.jellyfin.sdk.model.serializer.toUUIDOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koin.core.component.KoinComponent
@@ -54,7 +54,11 @@ class ExternalPlayer(
     private val apiClient: ApiClient = get()
     private val videosApi: VideosApi = apiClient.videosApi
 
-    private val playerContract = registry.register("externalplayer", lifecycleOwner, ActivityResultContracts.StartActivityForResult()) { result ->
+    private val playerContract = registry.register(
+        "externalplayer",
+        lifecycleOwner,
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
         val resultCode = result.resultCode
         val intent = result.data
         when (val action = intent?.action) {
@@ -81,7 +85,9 @@ class ExternalPlayer(
     @JavascriptInterface
     fun initPlayer(args: String) {
         val playOptions = PlayOptions.fromJson(JSONObject(args))
-        val itemId = playOptions?.run { mediaSourceId ?: ids.firstOrNull() }
+        val itemId = playOptions?.run {
+            ids.firstOrNull() ?: mediaSourceId?.toUUIDOrNull() // fallback if ids is empty
+        }
         if (playOptions == null || itemId == null) {
             context.toast(R.string.player_error_invalid_play_options)
             return
@@ -90,6 +96,7 @@ class ExternalPlayer(
         coroutinesScope.launch {
             mediaSourceResolver.resolveMediaSource(
                 itemId = itemId,
+                mediaSourceId = playOptions.mediaSourceId,
                 deviceProfile = externalPlayerProfile,
                 startTimeTicks = playOptions.startPositionTicks,
                 audioStreamIndex = playOptions.audioStreamIndex,
@@ -121,6 +128,7 @@ class ExternalPlayer(
         return subtitleProfiles.toString()
     }
 
+    @Suppress("LongMethod")
     private fun playMediaSource(playOptions: PlayOptions, source: JellyfinMediaSource) {
         val sourceInfo = source.sourceInfo
         val url = when (source.playMethod) {
@@ -150,8 +158,10 @@ class ExternalPlayer(
         }
 
         // Select correct subtitle
-        val selectedSubtitleIndex = source.subtitleStreams.binarySearchBy(playOptions.subtitleStreamIndex, selector = MediaStream::index)
-        source.selectSubtitleStream(selectedSubtitleIndex)
+        val selectedSubtitleStream = playOptions.subtitleStreamIndex?.let { index ->
+            source.mediaStreams.getOrNull(index)
+        }
+        source.selectSubtitleStream(selectedSubtitleStream)
 
         // Build playback intent
         val playerIntent = Intent(Intent.ACTION_VIEW).apply {
@@ -164,7 +174,7 @@ class ExternalPlayer(
             putExtra("return_result", true)
             putExtra("secure_uri", true)
 
-            val externalSubs = source.getExternalSubtitleStreams()
+            val externalSubs = source.externalSubtitleStreams
             val enabledSubUrl = when {
                 source.selectedSubtitleStream != null -> {
                     externalSubs.find { stream -> stream.index == source.selectedSubtitleStream?.index }?.let { sub ->
@@ -175,7 +185,10 @@ class ExternalPlayer(
             }
 
             // MX Player API / MPV
-            putExtra("subs", externalSubs.map { stream -> Uri.parse(apiClient.createUrl(stream.deliveryUrl)) }.toTypedArray())
+            val subtitleUris = externalSubs.map { stream ->
+                Uri.parse(apiClient.createUrl(stream.deliveryUrl))
+            }
+            putExtra("subs", subtitleUris.toTypedArray())
             putExtra("subs.name", externalSubs.map(ExternalSubtitleStream::displayTitle).toTypedArray())
             putExtra("subs.filename", externalSubs.map(ExternalSubtitleStream::language).toTypedArray())
             putExtra("subs.enable", enabledSubUrl?.let { url -> arrayOf(Uri.parse(url)) } ?: emptyArray())
@@ -184,7 +197,10 @@ class ExternalPlayer(
             if (enabledSubUrl != null) putExtra("subtitles_location", enabledSubUrl)
         }
         playerContract.launch(playerIntent)
-        Timber.d("Starting playback [id=${source.itemId}, title=${source.name}, playMethod=${source.playMethod}, startTimeMs=${source.startTimeMs}]")
+        Timber.d(
+            "Starting playback [id=${source.itemId}, title=${source.name}, " +
+                "playMethod=${source.playMethod}, startTimeMs=${source.startTimeMs}]",
+        )
     }
 
     private fun notifyEvent(event: String, parameters: String = "") {
@@ -278,7 +294,9 @@ class ExternalPlayer(
                 val extraPosition = data.getLongExtra("extra_position", 0L)
                 val extraDuration = data.getLongExtra("extra_duration", 0L)
                 if (extraPosition > 0L) {
-                    Timber.d("Playback stopped [player=$player, extraPosition=$extraPosition, extraDuration=$extraDuration]")
+                    Timber.d(
+                        "Playback stopped [player=$player, extraPosition=$extraPosition, extraDuration=$extraDuration]",
+                    )
                     notifyEvent(Constants.EVENT_TIME_UPDATE, "$extraPosition")
                     notifyEvent(Constants.EVENT_ENDED)
                 } else {
@@ -287,7 +305,9 @@ class ExternalPlayer(
                         notifyEvent(Constants.EVENT_TIME_UPDATE)
                         notifyEvent(Constants.EVENT_ENDED)
                     } else {
-                        Timber.d("Invalid state [player=$player, extraPosition=$extraPosition, extraDuration=$extraDuration]")
+                        Timber.d(
+                            "Invalid state [player=$player, extraPosition=$extraPosition, extraDuration=$extraDuration]",
+                        )
                         notifyEvent(Constants.EVENT_CANCELED)
                         context.toast(R.string.external_player_unknown_error, Toast.LENGTH_LONG)
                     }
@@ -306,9 +326,15 @@ class ExternalPlayer(
      */
     private fun getComponent(@ExternalPlayerPackage packageName: String): ComponentName? {
         return when (packageName) {
-            ExternalPlayerPackage.MPV_PLAYER -> ComponentName(packageName, "$packageName.MPVActivity")
-            ExternalPlayerPackage.MX_PLAYER_FREE, ExternalPlayerPackage.MX_PLAYER_PRO -> ComponentName(packageName, "$packageName.ActivityScreen")
-            ExternalPlayerPackage.VLC_PLAYER -> ComponentName(packageName, "$packageName.gui.video.VideoPlayerActivity")
+            ExternalPlayerPackage.MPV_PLAYER -> {
+                ComponentName(packageName, "$packageName.MPVActivity")
+            }
+            ExternalPlayerPackage.MX_PLAYER_FREE, ExternalPlayerPackage.MX_PLAYER_PRO -> {
+                ComponentName(packageName, "$packageName.ActivityScreen")
+            }
+            ExternalPlayerPackage.VLC_PLAYER -> {
+                ComponentName(packageName, "$packageName.gui.video.VideoPlayerActivity")
+            }
             else -> null
         }
     }

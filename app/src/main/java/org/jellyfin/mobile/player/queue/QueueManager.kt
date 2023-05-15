@@ -1,33 +1,31 @@
 package org.jellyfin.mobile.player.queue
 
-import android.app.Application
 import android.net.Uri
 import androidx.annotation.CheckResult
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
-import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.MediaItem
 import com.google.android.exoplayer2.source.MediaSource
 import com.google.android.exoplayer2.source.MergingMediaSource
 import com.google.android.exoplayer2.source.ProgressiveMediaSource
 import com.google.android.exoplayer2.source.SingleSampleMediaSource
 import com.google.android.exoplayer2.source.hls.HlsMediaSource
-import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import org.jellyfin.mobile.player.PlayerException
 import org.jellyfin.mobile.player.PlayerViewModel
 import org.jellyfin.mobile.player.deviceprofile.DeviceProfileBuilder
 import org.jellyfin.mobile.player.interaction.PlayOptions
+import org.jellyfin.mobile.player.source.ExternalSubtitleStream
 import org.jellyfin.mobile.player.source.JellyfinMediaSource
 import org.jellyfin.mobile.player.source.MediaSourceResolver
 import org.jellyfin.mobile.utils.Constants
-import org.jellyfin.mobile.utils.clearSelectionAndDisableRendererByType
-import org.jellyfin.mobile.utils.selectTrackByTypeAndGroup
 import org.jellyfin.sdk.api.client.ApiClient
 import org.jellyfin.sdk.api.client.extensions.videosApi
 import org.jellyfin.sdk.api.operations.VideosApi
 import org.jellyfin.sdk.model.api.MediaProtocol
 import org.jellyfin.sdk.model.api.MediaStream
+import org.jellyfin.sdk.model.api.MediaStreamType
 import org.jellyfin.sdk.model.api.PlayMethod
+import org.jellyfin.sdk.model.serializer.toUUIDOrNull
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 import org.koin.core.component.inject
@@ -37,15 +35,20 @@ class QueueManager(
     private val viewModel: PlayerViewModel,
 ) : KoinComponent {
     private val apiClient: ApiClient = get()
+    private val videosApi: VideosApi = apiClient.videosApi
     private val mediaSourceResolver: MediaSourceResolver by inject()
     private val deviceProfileBuilder: DeviceProfileBuilder by inject()
-    private val videosApi: VideosApi = apiClient.videosApi
-    val trackSelector = DefaultTrackSelector(viewModel.getApplication<Application>())
-    private val _mediaQueue: MutableLiveData<QueueItem.Loaded> = MutableLiveData()
-    val mediaQueue: LiveData<QueueItem.Loaded> get() = _mediaQueue
+    private val deviceProfile = deviceProfileBuilder.getDeviceProfile()
 
-    private var deviceProfile = deviceProfileBuilder.getDeviceProfile()
-    private var currentPlayOptions: PlayOptions? = null
+    private var currentQueue: List<UUID> = emptyList()
+    private var currentQueueIndex: Int = 0
+
+    private val _currentMediaSource: MutableLiveData<JellyfinMediaSource> = MutableLiveData()
+    val currentMediaSource: LiveData<JellyfinMediaSource>
+        get() = _currentMediaSource
+
+    inline val currentMediaSourceOrNull: JellyfinMediaSource?
+        get() = currentMediaSource.value
 
     /**
      * Handle initial playback options from fragment.
@@ -53,25 +56,63 @@ class QueueManager(
      *
      * @return an error of type [PlayerException] or null on success.
      */
-    suspend fun startPlayback(playOptions: PlayOptions, playWhenReady: Boolean): PlayerException? {
-        if (playOptions != currentPlayOptions) {
-            val itemId = playOptions.run { mediaSourceId ?: ids[playOptions.startIndex] }
-            mediaSourceResolver.resolveMediaSource(
-                itemId = itemId,
-                deviceProfile = deviceProfile,
-                maxStreamingBitrate = playOptions.maxBitrate,
-                startTimeTicks = playOptions.startPositionTicks,
-                audioStreamIndex = playOptions.audioStreamIndex,
-                subtitleStreamIndex = playOptions.subtitleStreamIndex,
-            ).onSuccess { jellyfinMediaSource ->
-                val previous = QueueItem.Stub(playOptions.ids.take(playOptions.startIndex))
-                val next = QueueItem.Stub(playOptions.ids.drop(playOptions.startIndex + 1))
-                createQueueItem(jellyfinMediaSource, previous, next).play(playWhenReady)
-                currentPlayOptions = playOptions
-            }.onFailure { error ->
-                // Should always be of this type, other errors are silently dropped
-                return error as? PlayerException
+    suspend fun initializePlaybackQueue(playOptions: PlayOptions): PlayerException? {
+        currentQueue = playOptions.ids
+        currentQueueIndex = playOptions.startIndex
+
+        val itemId = when {
+            currentQueue.isNotEmpty() -> currentQueue[currentQueueIndex]
+            else -> playOptions.mediaSourceId?.toUUIDOrNull()
+        } ?: return PlayerException.InvalidPlayOptions()
+
+        startPlayback(
+            itemId = itemId,
+            mediaSourceId = playOptions.mediaSourceId,
+            maxStreamingBitrate = playOptions.maxBitrate,
+            startTimeTicks = playOptions.startPositionTicks,
+            audioStreamIndex = playOptions.audioStreamIndex,
+            subtitleStreamIndex = playOptions.subtitleStreamIndex,
+            playWhenReady = true,
+        )
+
+        return null
+    }
+
+    /**
+     * Play a specific media item specified by [itemId] and [mediaSourceId].
+     *
+     * @return an error of type [PlayerException] or null on success.
+     */
+    private suspend fun startPlayback(
+        itemId: UUID,
+        mediaSourceId: String?,
+        maxStreamingBitrate: Int?,
+        startTimeTicks: Long? = null,
+        audioStreamIndex: Int? = null,
+        subtitleStreamIndex: Int? = null,
+        playWhenReady: Boolean = true,
+    ): PlayerException? {
+        mediaSourceResolver.resolveMediaSource(
+            itemId = itemId,
+            mediaSourceId = mediaSourceId,
+            deviceProfile = deviceProfile,
+            maxStreamingBitrate = maxStreamingBitrate,
+            startTimeTicks = startTimeTicks,
+            audioStreamIndex = audioStreamIndex,
+            subtitleStreamIndex = subtitleStreamIndex,
+        ).onSuccess { jellyfinMediaSource ->
+            // Ensure transcoding of the current element is stopped
+            currentMediaSourceOrNull?.let { oldMediaSource ->
+                viewModel.stopTranscoding(oldMediaSource)
             }
+
+            _currentMediaSource.value = jellyfinMediaSource
+
+            // Load new media source
+            viewModel.load(jellyfinMediaSource, prepareStreams(jellyfinMediaSource), playWhenReady)
+        }.onFailure { error ->
+            // Should always be of this type, other errors are silently dropped
+            return error as? PlayerException
         }
         return null
     }
@@ -80,65 +121,60 @@ class QueueManager(
      * Reinitialize current media source without changing settings
      */
     fun tryRestartPlayback() {
-        _mediaQueue.value?.play()
+        val currentMediaSource = currentMediaSourceOrNull ?: return
+
+        viewModel.load(currentMediaSource, prepareStreams(currentMediaSource), playWhenReady = true)
     }
 
     /**
      * Change the maximum bitrate to the specified value.
-     *
-     * @param positionMs the current stream position to return to after reloading the source.
-     * @param playWhenReady whether the stream should play after the source was reloaded.
      */
-    suspend fun changeBitrate(bitrate: Int?, positionMs: Long, playWhenReady: Boolean) {
-        val currentPlayOptions = currentPlayOptions ?: return
+    suspend fun changeBitrate(bitrate: Int?): Boolean {
+        val currentMediaSource = currentMediaSourceOrNull ?: return false
 
         // Bitrate didn't change, ignore
-        if (currentPlayOptions.maxBitrate == bitrate) return
+        if (currentMediaSource.maxStreamingBitrate == bitrate) return true
 
-        val playOptions = currentPlayOptions.copy(
-            startPositionTicks = positionMs * Constants.TICKS_PER_MILLISECOND,
-            maxBitrate = bitrate,
-        )
-        startPlayback(playOptions, playWhenReady)
+        val currentPlayState = viewModel.getStateAndPause() ?: return false
+
+        return startPlayback(
+            itemId = currentMediaSource.itemId,
+            mediaSourceId = currentMediaSource.id,
+            maxStreamingBitrate = bitrate,
+            startTimeTicks = currentPlayState.position * Constants.TICKS_PER_MILLISECOND,
+            audioStreamIndex = currentMediaSource.selectedAudioStreamIndex,
+            subtitleStreamIndex = currentMediaSource.selectedSubtitleStreamIndex,
+            playWhenReady = currentPlayState.playWhenReady,
+        ) == null
     }
 
-    @CheckResult
-    private fun createQueueItem(jellyfinMediaSource: JellyfinMediaSource, previous: QueueItem, next: QueueItem): QueueItem.Loaded {
-        val exoMediaSource = prepareStreams(jellyfinMediaSource)
-        return QueueItem.Loaded(jellyfinMediaSource, exoMediaSource, previous, next)
-    }
+    fun hasPrevious(): Boolean = currentQueue.isNotEmpty() && currentQueueIndex > 0
+
+    fun hasNext(): Boolean = currentQueue.isNotEmpty() && currentQueueIndex < currentQueue.lastIndex
 
     suspend fun previous(): Boolean {
-        val current = _mediaQueue.value ?: return false
-        when (val previous = current.previous) {
-            is QueueItem.Loaded -> {
-                previous.play()
-            }
-            is QueueItem.Stub -> {
-                val previousId = previous.ids.lastOrNull() ?: return false
-                val jellyfinMediaSource = mediaSourceResolver.resolveMediaSource(previousId, deviceProfile).getOrNull() ?: return false
+        if (!hasPrevious()) return false
 
-                val previousPrevious = QueueItem.Stub(previous.ids.dropLast(1))
-                createQueueItem(jellyfinMediaSource, previousPrevious, current).play()
-            }
-        }
+        val currentMediaSource = currentMediaSourceOrNull ?: return false
+
+        startPlayback(
+            itemId = currentQueue[--currentQueueIndex],
+            mediaSourceId = null,
+            maxStreamingBitrate = currentMediaSource.maxStreamingBitrate,
+        )
         return true
     }
 
     suspend fun next(): Boolean {
-        val current = _mediaQueue.value ?: return false
-        when (val next = current.next) {
-            is QueueItem.Loaded -> {
-                next.play()
-            }
-            is QueueItem.Stub -> {
-                val nextId = next.ids.firstOrNull() ?: return false
-                val jellyfinMediaSource = mediaSourceResolver.resolveMediaSource(nextId, deviceProfile).getOrNull() ?: return false
+        if (!hasNext()) return false
 
-                val nextNext = QueueItem.Stub(next.ids.drop(1))
-                createQueueItem(jellyfinMediaSource, current, nextNext).play()
-            }
-        }
+        val currentMediaSource = currentMediaSourceOrNull ?: return false
+
+        startPlayback(
+            itemId = currentQueue[++currentQueueIndex],
+            mediaSourceId = null,
+            maxStreamingBitrate = currentMediaSource.maxStreamingBitrate,
+        )
         return true
     }
 
@@ -152,7 +188,7 @@ class QueueManager(
     @CheckResult
     private fun prepareStreams(source: JellyfinMediaSource): MediaSource {
         val videoSource = createVideoMediaSource(source)
-        val subtitleSources = createSubtitleMediaSources(source)
+        val subtitleSources = createExternalSubtitleMediaSources(source)
         return when {
             subtitleSources.isNotEmpty() -> MergingMediaSource(videoSource, *subtitleSources)
             else -> videoSource
@@ -229,133 +265,65 @@ class QueueManager(
      * @return The parsed MediaSources for the subtitles.
      */
     @CheckResult
-    private fun createSubtitleMediaSources(
+    private fun createExternalSubtitleMediaSources(
         source: JellyfinMediaSource,
     ): Array<MediaSource> {
         val factory = get<SingleSampleMediaSource.Factory>()
-        return source.getExternalSubtitleStreams().map { stream ->
+        return source.externalSubtitleStreams.map { stream ->
             val uri = Uri.parse(apiClient.createUrl(stream.deliveryUrl))
             val mediaItem = MediaItem.SubtitleConfiguration.Builder(uri).apply {
-                setId(stream.index.toString())
+                setId("${ExternalSubtitleStream.ID_PREFIX}${stream.index}")
                 setLabel(stream.displayTitle)
                 setMimeType(stream.mimeType)
                 setLanguage(stream.language)
-                setSelectionFlags(C.SELECTION_FLAG_AUTOSELECT)
             }.build()
             factory.createMediaSource(mediaItem, source.runTimeMs)
         }.toTypedArray()
     }
 
-    fun selectInitialTracks() {
-        val queueItem = _mediaQueue.value ?: return
-        val mediaSource = queueItem.jellyfinMediaSource
-        selectAudioTrack(mediaSource.selectedAudioStream?.index ?: -1, initial = true)
-        selectSubtitle(mediaSource.selectedSubtitleStream?.index ?: -1, initial = true)
-    }
-
     /**
-     * Select an audio track in the media source and apply changes to the current player.
+     * Switch to the specified [audio stream][stream] and restart playback, for example while transcoding.
      *
-     * @param streamIndex the [MediaStream.index] that should be selected
-     * @return true if the audio track was changed
+     * @return true if playback was restarted with the new selection.
      */
-    fun selectAudioTrack(streamIndex: Int): Boolean {
-        return selectAudioTrack(streamIndex, initial = false)
+    suspend fun selectAudioStreamAndRestartPlayback(stream: MediaStream): Boolean {
+        require(stream.type == MediaStreamType.AUDIO)
+        val currentMediaSource = currentMediaSourceOrNull ?: return false
+        val currentPlayState = viewModel.getStateAndPause() ?: return false
+
+        startPlayback(
+            itemId = currentMediaSource.itemId,
+            mediaSourceId = currentMediaSource.id,
+            maxStreamingBitrate = currentMediaSource.maxStreamingBitrate,
+            startTimeTicks = currentPlayState.position * Constants.TICKS_PER_MILLISECOND,
+            audioStreamIndex = stream.index,
+            subtitleStreamIndex = currentMediaSource.selectedSubtitleStreamIndex,
+            playWhenReady = currentPlayState.playWhenReady,
+        )
+        return true
     }
 
     /**
-     * @param initial whether this is an initial selection and checks for re-selection should be skipped.
-     * @see selectAudioTrack
-     */
-    @Suppress("ReturnCount")
-    private fun selectAudioTrack(streamIndex: Int, initial: Boolean): Boolean {
-        val mediaSource = _mediaQueue.value?.jellyfinMediaSource ?: return false
-        val sourceIndex = mediaSource.audioStreams.binarySearchBy(streamIndex, selector = MediaStream::index)
-
-        when {
-            // Fast-pass: Skip execution on subsequent calls with the correct selection or if only one track exists
-            mediaSource.audioStreams.size == 1 || !initial && streamIndex == mediaSource.selectedAudioStream?.index -> return true
-            // For transcoded media, special handling is required
-            mediaSource.playMethod == PlayMethod.TRANSCODE -> {
-                // TODO: handle stream selection for transcodes (reinitialize media source)
-                return true
-            }
-            // Apply selection in media source, abort on failure
-            !mediaSource.selectAudioStream(sourceIndex) -> return false
-        }
-
-        return trackSelector.selectTrackByTypeAndGroup(C.TRACK_TYPE_AUDIO, sourceIndex)
-    }
-
-    /**
-     * Select a subtitle track in the media source and apply changes to the current player.
+     * Switch to the specified [subtitle stream][stream] and restart playback,
+     * for example because the selected subtitle has to be encoded into the video.
      *
-     * @param streamIndex the [MediaStream.index] that should be selected
-     * @return true if the subtitle was changed
+     * @param stream The subtitle stream to select, or null to disable subtitles.
+     * @return true if playback was restarted with the new selection.
      */
-    fun selectSubtitle(streamIndex: Int): Boolean {
-        return selectSubtitle(streamIndex, initial = false)
-    }
+    suspend fun selectSubtitleStreamAndRestartPlayback(stream: MediaStream?): Boolean {
+        require(stream == null || stream.type == MediaStreamType.SUBTITLE)
+        val currentMediaSource = currentMediaSourceOrNull ?: return false
+        val currentPlayState = viewModel.getStateAndPause() ?: return false
 
-    /**
-     * @param initial whether this is an initial selection and checks for re-selection should be skipped.
-     * @see selectSubtitle
-     */
-    private fun selectSubtitle(streamIndex: Int, initial: Boolean): Boolean {
-        val mediaSource = _mediaQueue.value?.jellyfinMediaSource ?: return false
-        val sourceIndex = mediaSource.subtitleStreams.binarySearchBy(streamIndex, selector = MediaStream::index)
-
-        when {
-            // Fast-pass: Skip execution on subsequent calls with the correct selection
-            !initial && streamIndex == mediaSource.selectedSubtitleStream?.index -> return true
-            // Apply selection in media source, abort on failure
-            !mediaSource.selectSubtitleStream(sourceIndex) -> return false
-        }
-
-        return when {
-            // Select new subtitle with suitable renderer
-            sourceIndex >= 0 -> trackSelector.selectTrackByTypeAndGroup(C.TRACK_TYPE_TEXT, sourceIndex)
-            // No subtitle selected, clear selection overrides and disable all subtitle renderers
-            else -> trackSelector.clearSelectionAndDisableRendererByType(C.TRACK_TYPE_TEXT)
-        }
-    }
-
-    /**
-     * Toggle subtitles, selecting the first by [MediaStream.index] if there are multiple.
-     *
-     * @return true if subtitles are enabled now, false if not
-     */
-    fun toggleSubtitles(): Boolean {
-        val mediaSource = _mediaQueue.value?.jellyfinMediaSource ?: return false
-        selectSubtitle(if (mediaSource.selectedSubtitleStream == null) mediaSource.subtitleStreams.firstOrNull()?.index ?: -1 else -1)
-        return mediaSource.selectedSubtitleStream != null
-    }
-
-    sealed class QueueItem {
-        class Loaded(
-            val jellyfinMediaSource: JellyfinMediaSource,
-            val exoMediaSource: MediaSource,
-            val previous: QueueItem,
-            val next: QueueItem,
-        ) : QueueItem() {
-            fun hasPrevious(): Boolean = when (previous) {
-                is Loaded -> true
-                is Stub -> previous.ids.isNotEmpty()
-            }
-
-            fun hasNext(): Boolean = when (next) {
-                is Loaded -> true
-                is Stub -> next.ids.isNotEmpty()
-            }
-        }
-
-        class Stub(
-            val ids: List<UUID>,
-        ) : QueueItem()
-    }
-
-    private fun QueueItem.Loaded.play(playWhenReady: Boolean = true) {
-        _mediaQueue.value = this
-        viewModel.load(this, playWhenReady)
+        startPlayback(
+            itemId = currentMediaSource.itemId,
+            mediaSourceId = currentMediaSource.id,
+            maxStreamingBitrate = currentMediaSource.maxStreamingBitrate,
+            startTimeTicks = currentPlayState.position * Constants.TICKS_PER_MILLISECOND,
+            audioStreamIndex = currentMediaSource.selectedAudioStreamIndex,
+            subtitleStreamIndex = stream?.index ?: -1, // -1 disables subtitles, null would select the default subtitle
+            playWhenReady = currentPlayState.playWhenReady,
+        )
+        return true
     }
 }

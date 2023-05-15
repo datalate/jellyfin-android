@@ -19,8 +19,13 @@ import com.google.android.exoplayer2.PlaybackException
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector
 import com.google.android.exoplayer2.mediacodec.MediaCodecDecoderException
+import com.google.android.exoplayer2.mediacodec.MediaCodecInfo
+import com.google.android.exoplayer2.mediacodec.MediaCodecSelector
+import com.google.android.exoplayer2.source.MediaSource
+import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import com.google.android.exoplayer2.util.Clock
 import com.google.android.exoplayer2.util.EventLogger
+import com.google.android.exoplayer2.util.MimeTypes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,7 +40,9 @@ import org.jellyfin.mobile.player.interaction.PlayerMediaSessionCallback
 import org.jellyfin.mobile.player.interaction.PlayerNotificationHelper
 import org.jellyfin.mobile.player.queue.QueueManager
 import org.jellyfin.mobile.player.source.JellyfinMediaSource
+import org.jellyfin.mobile.player.ui.DecoderType
 import org.jellyfin.mobile.player.ui.DisplayPreferences
+import org.jellyfin.mobile.player.ui.PlayState
 import org.jellyfin.mobile.utils.Constants
 import org.jellyfin.mobile.utils.Constants.SUPPORTED_VIDEO_PLAYER_PLAYBACK_ACTIONS
 import org.jellyfin.mobile.utils.applyDefaultAudioAttributes
@@ -68,6 +75,7 @@ import org.koin.core.qualifier.named
 import timber.log.Timber
 import java.util.concurrent.atomic.AtomicBoolean
 
+@Suppress("TooManyFunctions")
 class PlayerViewModel(application: Application) : AndroidViewModel(application), KoinComponent, Player.Listener {
     private val apiClient: ApiClient = get()
     private val displayPreferencesApi: DisplayPreferencesApi = apiClient.displayPreferencesApi
@@ -79,19 +87,25 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     val notificationHelper: PlayerNotificationHelper by lazy { PlayerNotificationHelper(this) }
 
     // Media source handling
-    val mediaQueueManager = QueueManager(this)
+    private val trackSelector = DefaultTrackSelector(getApplication())
+    val trackSelectionHelper = TrackSelectionHelper(this, trackSelector)
+    val queueManager = QueueManager(this)
     val mediaSourceOrNull: JellyfinMediaSource?
-        get() = mediaQueueManager.mediaQueue.value?.jellyfinMediaSource
+        get() = queueManager.currentMediaSourceOrNull
 
     // ExoPlayer
     private val _player = MutableLiveData<ExoPlayer?>()
     private val _playerState = MutableLiveData<Int>()
+    private val _decoderType = MutableLiveData<DecoderType>()
     val player: LiveData<ExoPlayer?> get() = _player
     val playerState: LiveData<Int> get() = _playerState
+    val decoderType: LiveData<DecoderType> get() = _decoderType
+
+    private val _error = MutableLiveData<String>()
+    val error: LiveData<String> = _error
+
     private val eventLogger = EventLogger()
-    private val analyticsCollector = DefaultAnalyticsCollector(Clock.DEFAULT).apply {
-        addListener(eventLogger)
-    }
+    private var analyticsCollector = buildAnalyticsCollector()
     private val initialTracksSelected = AtomicBoolean(false)
     private var fallbackPreferExtensionRenderers = false
 
@@ -105,7 +119,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     private val playerEventChannel: Channel<PlayerEvent> by inject(named(PLAYER_EVENT_CHANNEL))
 
     val mediaSession: MediaSession by lazy {
-        MediaSession(getApplication<Application>().applicationContext, javaClass.simpleName.removePrefix(BuildConfig.APPLICATION_ID)).apply {
+        MediaSession(
+            getApplication<Application>().applicationContext,
+            javaClass.simpleName.removePrefix(BuildConfig.APPLICATION_ID),
+        ).apply {
             @Suppress("DEPRECATION")
             setFlags(MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS or MediaSession.FLAG_HANDLES_MEDIA_BUTTONS)
             setCallback(mediaSessionCallback)
@@ -157,6 +174,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
         }
     }
 
+    private fun buildAnalyticsCollector() = DefaultAnalyticsCollector(Clock.DEFAULT).apply {
+        addListener(eventLogger)
+    }
+
     /**
      * Setup a new [ExoPlayer] for video playback, register callbacks and set attributes
      */
@@ -168,10 +189,36 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
                 else -> DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
             }
             setExtensionRendererMode(rendererMode)
+            setMediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+                val decoderInfoList = MediaCodecSelector.DEFAULT.getDecoderInfos(
+                    mimeType,
+                    requiresSecureDecoder,
+                    requiresTunnelingDecoder,
+                )
+                // Allow decoder selection only for video track
+                if (!MimeTypes.isVideo(mimeType)) {
+                    return@setMediaCodecSelector decoderInfoList
+                }
+                val filteredDecoderList = when (decoderType.value) {
+                    DecoderType.HARDWARE -> decoderInfoList.filter(MediaCodecInfo::hardwareAccelerated)
+                    DecoderType.SOFTWARE -> decoderInfoList.filterNot(MediaCodecInfo::hardwareAccelerated)
+                    else -> decoderInfoList
+                }
+                // Update the decoderType based on the first decoder selected
+                filteredDecoderList.firstOrNull()?.let { decoder ->
+                    val decoderType = when {
+                        decoder.hardwareAccelerated -> DecoderType.HARDWARE
+                        else -> DecoderType.SOFTWARE
+                    }
+                    _decoderType.postValue(decoderType)
+                }
+
+                filteredDecoderList
+            }
         }
         _player.value = ExoPlayer.Builder(getApplication(), renderersFactory, get()).apply {
             setUsePlatformDiagnostics(false)
-            setTrackSelector(mediaQueueManager.trackSelector)
+            setTrackSelector(trackSelector)
             setAnalyticsCollector(analyticsCollector)
         }.build().apply {
             addListener(this@PlayerViewModel)
@@ -193,22 +240,22 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
         _player.value = null
     }
 
-    fun load(queueItem: QueueManager.QueueItem.Loaded, playWhenReady: Boolean) {
+    fun load(jellyfinMediaSource: JellyfinMediaSource, exoMediaSource: MediaSource, playWhenReady: Boolean) {
         val player = playerOrNull ?: return
 
-        player.setMediaSource(queueItem.exoMediaSource)
+        player.setMediaSource(exoMediaSource)
         player.prepare()
 
         initialTracksSelected.set(false)
 
-        val startTime = queueItem.jellyfinMediaSource.startTimeMs
+        val startTime = jellyfinMediaSource.startTimeMs
         if (startTime > 0) player.seekTo(startTime)
         player.playWhenReady = playWhenReady
 
-        mediaSession.setMetadata(queueItem.jellyfinMediaSource.toMediaMetadata())
+        mediaSession.setMetadata(jellyfinMediaSource.toMediaMetadata())
 
         viewModelScope.launch {
-            player.reportPlaybackStart(queueItem.jellyfinMediaSource)
+            player.reportPlaybackStart(jellyfinMediaSource)
         }
     }
 
@@ -223,6 +270,25 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
 
     private fun stopProgressUpdates() {
         progressUpdateJob?.cancel()
+    }
+
+    /**
+     * Updates the decoder of the [Player]. This will destroy the current player and
+     * recreate the player with the selected decoder type
+     */
+    fun updateDecoderType(type: DecoderType) {
+        _decoderType.postValue(type)
+        analyticsCollector.release()
+        val playedTime = playerOrNull?.currentPosition ?: 0L
+        // Stop and release the player without ending playback
+        playerOrNull?.run {
+            removeListener(this@PlayerViewModel)
+            release()
+        }
+        analyticsCollector = buildAnalyticsCollector()
+        setupPlayer()
+        queueManager.currentMediaSourceOrNull?.startTimeMs = playedTime
+        queueManager.tryRestartPlayback()
     }
 
     private suspend fun Player.reportPlaybackStart(mediaSource: JellyfinMediaSource) {
@@ -304,15 +370,19 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
                 }
 
                 // Stop active encoding if transcoding
-                if (mediaSource.playMethod == PlayMethod.TRANSCODE) {
-                    hlsSegmentApi.stopEncodingProcess(
-                        deviceId = apiClient.deviceInfo.id,
-                        playSessionId = mediaSource.playSessionId,
-                    )
-                }
+                stopTranscoding(mediaSource)
             } catch (e: ApiClientException) {
                 Timber.e(e, "Failed to report playback stop")
             }
+        }
+    }
+
+    suspend fun stopTranscoding(mediaSource: JellyfinMediaSource) {
+        if (mediaSource.playMethod == PlayMethod.TRANSCODE) {
+            hlsSegmentApi.stopEncodingProcess(
+                deviceId = apiClient.deviceInfo.id,
+                playSessionId = mediaSource.playSessionId,
+            )
         }
     }
 
@@ -340,7 +410,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
             // Skip to previous element
             player.currentPosition <= Constants.MAX_SKIP_TO_PREV_MS -> viewModelScope.launch {
                 pause()
-                if (!mediaQueueManager.previous()) {
+                if (!queueManager.previous()) {
                     // Skip to previous failed, go to start of video anyway
                     playerOrNull?.seekTo(0)
                     play()
@@ -353,33 +423,26 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
 
     fun skipToNext() {
         viewModelScope.launch {
-            mediaQueueManager.next()
+            queueManager.next()
         }
     }
 
-    /**
-     * @see QueueManager.selectAudioTrack
-     */
-    fun selectAudioTrack(streamIndex: Int): Boolean = mediaQueueManager.selectAudioTrack(streamIndex).also { success ->
-        if (success) playerOrNull?.logTracks(analyticsCollector)
-    }
-
-    /**
-     * @see QueueManager.selectSubtitle
-     */
-    fun selectSubtitle(streamIndex: Int): Boolean = mediaQueueManager.selectSubtitle(streamIndex).also { success ->
-        if (success) playerOrNull?.logTracks(analyticsCollector)
-    }
-
-    fun changeBitrate(bitrate: Int?) {
-        val player = playerOrNull ?: return
+    fun getStateAndPause(): PlayState? {
+        val player = playerOrNull ?: return null
 
         val playWhenReady = player.playWhenReady
-        pause()
+        player.pause()
         val position = player.contentPosition
-        viewModelScope.launch {
-            mediaQueueManager.changeBitrate(bitrate, position, playWhenReady)
-        }
+
+        return PlayState(playWhenReady, position)
+    }
+
+    fun logTracks() {
+        playerOrNull?.logTracks(analyticsCollector)
+    }
+
+    suspend fun changeBitrate(bitrate: Int?): Boolean {
+        return queueManager.changeBitrate(bitrate)
     }
 
     /**
@@ -422,7 +485,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
         // Initialise various components
         if (playbackState == Player.STATE_READY) {
             if (!initialTracksSelected.getAndSet(true)) {
-                mediaQueueManager.selectInitialTracks()
+                trackSelectionHelper.selectInitialTracks()
             }
             mediaSession.isActive = true
             notificationHelper.postNotification()
@@ -437,9 +500,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
 
         // Update media session
         var playbackActions = SUPPORTED_VIDEO_PLAYER_PLAYBACK_ACTIONS
-        mediaQueueManager.mediaQueue.value?.let { queueItem ->
-            if (queueItem.hasPrevious()) playbackActions = playbackActions or PlaybackState.ACTION_SKIP_TO_PREVIOUS
-            if (queueItem.hasNext()) playbackActions = playbackActions or PlaybackState.ACTION_SKIP_TO_NEXT
+        if (queueManager.hasPrevious()) {
+            playbackActions = playbackActions or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+        }
+        if (queueManager.hasNext()) {
+            playbackActions = playbackActions or PlaybackState.ACTION_SKIP_TO_NEXT
         }
         mediaSession.setPlaybackState(player, playbackActions)
 
@@ -451,9 +516,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
                 }
                 Player.STATE_ENDED -> {
                     reportPlaybackStop()
-
-                    if (!mediaQueueManager.next())
+                    if (!queueManager.next()) {
                         releasePlayer()
+                    }
                 }
             }
         }
@@ -468,7 +533,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
             }
             fallbackPreferExtensionRenderers = true
             setupPlayer()
-            mediaQueueManager.tryRestartPlayback()
+            queueManager.tryRestartPlayback()
+        } else {
+            _error.postValue(error.localizedMessage.orEmpty())
         }
     }
 

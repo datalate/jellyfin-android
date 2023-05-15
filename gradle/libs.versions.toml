@@ -1,22 +1,23 @@
 [versions]
 # Plugins
-android-plugin = "7.3.1"
+android-plugin = "7.4.2"
 kotlin = "1.7.20"
 kotlin-ksp = "1.7.20-1.0.8"
-detekt = "1.21.0"
+detekt = "1.22.0"
 android-junit5 = "1.8.2.1"
-dependencyupdates = "0.43.0"
+dependencyupdates = "0.46.0"
 
 # KotlinX
 coroutines = "1.6.4"
 
 # Core
-koin = "3.3.0"
-koin-compose = "3.3.0"
+koin = "3.3.3"
+koin-compose = "3.4.2"
 androidx-core = "1.9.0"
-androidx-appcompat = "1.5.1"
+androidx-core-splashscreen = "1.0.0"
+androidx-appcompat = "1.6.1"
 androidx-activity = "1.6.1"
-androidx-fragment = "1.5.4"
+androidx-fragment = "1.5.5"
 androiddesugarlibs = "1.2.2"
 
 # Lifecycle extensions
@@ -24,29 +25,31 @@ androidx-lifecycle = "2.5.1"
 
 # UI
 androidx-constraintlayout = "2.1.4"
-google-material = "1.7.0"
-androidx-webkit = "1.5.0"
-modernandroidpreferences = "2.3.1"
+google-material = "1.8.0"
+androidx-webkit = "1.6.1"
+modernandroidpreferences = "2.3.2"
 
 # Compose
-compose = "1.3.1"
+compose = "1.3.3"
+compose-foundation = "1.3.1"
+compose-material = "1.3.1"
 compose-compiler = "1.3.2"
 
 # Network
-jellyfin-sdk = "1.3.7"
+jellyfin-sdk = "1.4.2"
 okhttp = "4.10.0"
 coil = "2.2.2"
-cronet-embedded = "106.5249.126"
+cronet-embedded = "108.5359.79"
 
 # Media
 androidx-media = "1.6.0"
 androidx-mediarouter = "1.3.1"
-exoplayer = "2.18.1"
-jellyfin-exoplayer-ffmpegextension = "2.18.1+2"
+exoplayer = "2.18.6"
+jellyfin-exoplayer-ffmpegextension = "2.18.6+1"
 playservices = "21.2.0"
 
 # Room
-androidx-room = "2.4.3"
+androidx-room = "2.5.0"
 
 # Monitoring
 timber = "5.0.1"
@@ -54,11 +57,11 @@ leakcanary = "2.10"
 redscreenofdeath = "0.1.3"
 
 # Testing
-junit = "5.9.1"
-kotest = "5.5.4"
-mockk = "1.13.2"
-androidx-test-runner = "1.5.1"
-androidx-test-espresso = "3.5.0"
+junit = "5.9.2"
+kotest = "5.5.5"
+mockk = "1.13.4"
+androidx-test-runner = "1.5.2"
+androidx-test-espresso = "3.5.1"
 
 [plugins]
 android-app = { id = "com.android.application", version.ref = "android-plugin" }
@@ -78,6 +81,7 @@ coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutin
 koin = { group = "io.insert-koin", name = "koin-android", version.ref = "koin" }
 koin-compose = { group = "io.insert-koin", name = "koin-androidx-compose", version.ref = "koin-compose" }
 androidx-core = { group = "androidx.core", name = "core-ktx", version.ref = "androidx-core" }
+androidx-core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "androidx-core-splashscreen" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidx-appcompat" }
 androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "androidx-activity" }
 androidx-fragment = { group = "androidx.fragment", name = "fragment-ktx", version.ref = "androidx-fragment" }
@@ -99,11 +103,11 @@ modernandroidpreferences = { group = "de.maxr1998", name = "modernandroidprefere
 # Compose
 compose-runtime = { group = "androidx.compose.runtime", name = "runtime", version.ref = "compose" }
 compose-ui = { group = "androidx.compose.ui", name = "ui", version.ref = "compose" }
-compose-foundation = { group = "androidx.compose.foundation", name = "foundation", version.ref = "compose" }
 compose-animation = { group = "androidx.compose.animation", name = "animation", version.ref = "compose" }
-compose-material = { group = "androidx.compose.material", name = "material", version.ref = "compose" }
-compose-material-icons = { group = "androidx.compose.material", name = "material-icons-core", version.ref = "compose" }
-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended", version.ref = "compose" }
+compose-foundation = { group = "androidx.compose.foundation", name = "foundation", version.ref = "compose-foundation" }
+compose-material = { group = "androidx.compose.material", name = "material", version.ref = "compose-material" }
+compose-material-icons = { group = "androidx.compose.material", name = "material-icons-core", version.ref = "compose-material" }
+compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended", version.ref = "compose-material" }
 
 # Network
 jellyfin-sdk = { group = "org.jellyfin.sdk", name = "jellyfin-core", version.ref = "jellyfin-sdk" }

@@ -14,11 +14,11 @@ import android.view.OrientationEventListener
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-import android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
 import android.widget.ImageButton
-import android.widget.TextView
 import androidx.annotation.RequiresApi
+import androidx.appcompat.widget.Toolbar
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
@@ -26,8 +26,10 @@ import androidx.fragment.app.viewModels
 import androidx.lifecycle.lifecycleScope
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.ui.PlayerView
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import org.jellyfin.mobile.R
+import org.jellyfin.mobile.app.AppPreferences
 import org.jellyfin.mobile.databinding.ExoPlayerControlViewBinding
 import org.jellyfin.mobile.databinding.FragmentPlayerBinding
 import org.jellyfin.mobile.player.PlayerException
@@ -40,14 +42,15 @@ import org.jellyfin.mobile.utils.Constants.PIP_MIN_RATIONAL
 import org.jellyfin.mobile.utils.SmartOrientationListener
 import org.jellyfin.mobile.utils.brightness
 import org.jellyfin.mobile.utils.extensions.aspectRational
-import org.jellyfin.mobile.utils.extensions.disableFullscreen
-import org.jellyfin.mobile.utils.extensions.enableFullscreen
-import org.jellyfin.mobile.utils.extensions.isFullscreen
+import org.jellyfin.mobile.utils.extensions.getParcelableCompat
 import org.jellyfin.mobile.utils.extensions.isLandscape
+import org.jellyfin.mobile.utils.extensions.keepScreenOn
 import org.jellyfin.mobile.utils.toast
 import org.jellyfin.sdk.model.api.MediaStream
+import org.koin.android.ext.android.inject
 
 class PlayerFragment : Fragment() {
+    private val appPreferences: AppPreferences by inject()
     private val viewModel: PlayerViewModel by viewModels()
     private var _playerBinding: FragmentPlayerBinding? = null
     private val playerBinding: FragmentPlayerBinding get() = _playerBinding!!
@@ -57,10 +60,11 @@ class PlayerFragment : Fragment() {
     private var _playerControlsBinding: ExoPlayerControlViewBinding? = null
     private val playerControlsBinding: ExoPlayerControlViewBinding get() = _playerControlsBinding!!
     private val playerControlsView: View get() = playerControlsBinding.root
-    private val titleTextView: TextView get() = playerControlsBinding.trackTitle
+    private val toolbar: Toolbar get() = playerControlsBinding.toolbar
     private val fullscreenSwitcher: ImageButton get() = playerControlsBinding.fullscreenSwitcher
     private var playerMenus: PlayerMenus? = null
 
+    private lateinit var playerFullscreenHelper: PlayerFullscreenHelper
     lateinit var playerLockScreenHelper: PlayerLockScreenHelper
     lateinit var playerGestureHelper: PlayerGestureHelper
 
@@ -87,42 +91,39 @@ class PlayerFragment : Fragment() {
         }
         viewModel.playerState.observe(this) { playerState ->
             val isPlaying = viewModel.playerOrNull?.isPlaying == true
-            val window = requireActivity().window
-            if (isPlaying) {
-                window.addFlags(FLAG_KEEP_SCREEN_ON)
-            } else {
-                window.clearFlags(FLAG_KEEP_SCREEN_ON)
-            }
+            requireActivity().window.keepScreenOn = isPlaying
             loadingIndicator.isVisible = playerState == Player.STATE_BUFFERING
         }
-        viewModel.mediaQueueManager.mediaQueue.observe(this) { queueItem ->
-            val jellyfinMediaSource = queueItem.jellyfinMediaSource
-
-            with(requireActivity()) {
-                if (jellyfinMediaSource.selectedVideoStream?.isLandscape != false) {
-                    // Switch to landscape for landscape videos
-                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                } else {
-                    // For portrait videos, immediately enable fullscreen
-                    enableFullscreen()
-                    updateFullscreenSwitcher(isFullscreen())
-                }
+        viewModel.decoderType.observe(this) { type ->
+            playerMenus?.updatedSelectedDecoder(type)
+        }
+        viewModel.error.observe(this) { message ->
+            val safeMessage = message.ifEmpty { requireContext().getString(R.string.player_error_unspecific_exception) }
+            requireContext().toast(safeMessage)
+        }
+        viewModel.queueManager.currentMediaSource.observe(this) { mediaSource ->
+            if (mediaSource.selectedVideoStream?.isLandscape == false) {
+                // For portrait videos, immediately enable fullscreen
+                playerFullscreenHelper.enableFullscreen()
+            } else if (appPreferences.exoPlayerStartLandscapeVideoInLandscape) {
+                // Auto-switch to landscape for landscape videos if enabled
+                requireActivity().requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
 
             // Update title and player menus
-            titleTextView.text = jellyfinMediaSource.name
-            playerMenus?.onQueueItemChanged(queueItem)
+            toolbar.title = mediaSource.name
+            playerMenus?.onQueueItemChanged(mediaSource, viewModel.queueManager.hasNext())
         }
 
         // Handle fragment arguments, extract playback options and start playback
         lifecycleScope.launch {
             val context = requireContext()
-            val playOptions = requireArguments().getParcelable<PlayOptions>(Constants.EXTRA_MEDIA_PLAY_OPTIONS)
+            val playOptions = requireArguments().getParcelableCompat<PlayOptions>(Constants.EXTRA_MEDIA_PLAY_OPTIONS)
             if (playOptions == null) {
                 context.toast(R.string.player_error_invalid_play_options)
                 return@launch
             }
-            when (viewModel.mediaQueueManager.startPlayback(playOptions, playWhenReady = true)) {
+            when (viewModel.queueManager.initializePlaybackQueue(playOptions)) {
                 is PlayerException.InvalidPlayOptions -> context.toast(R.string.player_error_invalid_play_options)
                 is PlayerException.NetworkFailure -> context.toast(R.string.player_error_network_failure)
                 is PlayerException.UnsupportedContent -> context.toast(R.string.player_error_unsupported_content)
@@ -137,26 +138,41 @@ class PlayerFragment : Fragment() {
         return playerBinding.root
     }
 
-    @Suppress("DEPRECATION")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        val window = requireActivity().window
 
-        // Handle system window insets
+        // Insets handling
         ViewCompat.setOnApplyWindowInsetsListener(playerBinding.root) { _, insets ->
+            val systemInsets = insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.systemBars())
+            playerFullscreenHelper.onWindowInsetsChanged(insets)
+
             playerControlsView.updatePadding(
-                top = insets.systemWindowInsetTop,
-                left = insets.systemWindowInsetLeft,
-                right = insets.systemWindowInsetRight,
-                bottom = insets.systemWindowInsetBottom,
+                top = systemInsets.top,
+                left = systemInsets.left,
+                right = systemInsets.right,
+                bottom = systemInsets.bottom,
             )
             playerOverlay.updatePadding(
-                top = insets.systemWindowInsetTop,
-                left = insets.systemWindowInsetLeft,
-                right = insets.systemWindowInsetRight,
-                bottom = insets.systemWindowInsetBottom,
+                top = systemInsets.top,
+                left = systemInsets.left,
+                right = systemInsets.right,
+                bottom = systemInsets.bottom,
             )
+
+            // Update fullscreen switcher icon
+            val fullscreenDrawable = when {
+                playerFullscreenHelper.isFullscreen -> R.drawable.ic_fullscreen_exit_white_32dp
+                else -> R.drawable.ic_fullscreen_enter_white_32dp
+            }
+            fullscreenSwitcher.setImageResource(fullscreenDrawable)
+
             insets
         }
+        ViewCompat.requestApplyInsets(view)
+
+        // Handle toolbar back button
+        toolbar.setNavigationOnClickListener { parentFragmentManager.popBackStack() }
 
         // Create playback menus
         playerMenus = PlayerMenus(this, playerBinding, playerControlsBinding)
@@ -164,9 +180,8 @@ class PlayerFragment : Fragment() {
         // Set controller timeout
         suppressControllerAutoHide(false)
 
+        playerFullscreenHelper = PlayerFullscreenHelper(window)
         playerLockScreenHelper = PlayerLockScreenHelper(this, playerBinding, orientationListener)
-
-        // Setup gesture handling
         playerGestureHelper = PlayerGestureHelper(this, playerBinding, playerLockScreenHelper)
 
         // Handle fullscreen switcher
@@ -181,10 +196,7 @@ class PlayerFragment : Fragment() {
                 }
             } else {
                 // Portrait video, only handle fullscreen state
-                with(requireActivity()) {
-                    if (isFullscreen()) disableFullscreen() else enableFullscreen()
-                    updateFullscreenSwitcher(isFullscreen())
-                }
+                playerFullscreenHelper.toggleFullscreen()
             }
         }
     }
@@ -198,8 +210,8 @@ class PlayerFragment : Fragment() {
         super.onResume()
 
         // When returning from another app, fullscreen mode for landscape orientation has to be set again
-        with(requireActivity()) {
-            if (isLandscape()) enableFullscreen()
+        if (isLandscape()) {
+            playerFullscreenHelper.enableFullscreen()
         }
     }
 
@@ -207,30 +219,21 @@ class PlayerFragment : Fragment() {
      * Handle current orientation and update fullscreen state and switcher icon
      */
     private fun updateFullscreenState(configuration: Configuration) {
-        with(requireActivity()) {
-            // Do not handle any orientation changes while being in Picture-in-Picture mode
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode)
-                return
+        // Do not handle any orientation changes while being in Picture-in-Picture mode
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && requireActivity().isInPictureInPictureMode) {
+            return
+        }
 
-            if (isLandscape(configuration)) {
+        when {
+            isLandscape(configuration) -> {
                 // Landscape orientation is always fullscreen
-                enableFullscreen()
-            } else {
-                // Disable fullscreen for landscape video in portrait orientation
-                if (currentVideoStream?.isLandscape != false) {
-                    disableFullscreen()
-                }
+                playerFullscreenHelper.enableFullscreen()
             }
-            updateFullscreenSwitcher(isFullscreen())
+            currentVideoStream?.isLandscape != false -> {
+                // Disable fullscreen for landscape video in portrait orientation
+                playerFullscreenHelper.disableFullscreen()
+            }
         }
-    }
-
-    private fun updateFullscreenSwitcher(fullscreen: Boolean) {
-        val fullscreenDrawable = when {
-            fullscreen -> R.drawable.ic_fullscreen_exit_white_32dp
-            else -> R.drawable.ic_fullscreen_enter_white_32dp
-        }
-        fullscreenSwitcher.setImageResource(fullscreenDrawable)
     }
 
     /**
@@ -248,17 +251,21 @@ class PlayerFragment : Fragment() {
     fun onFastForward() = viewModel.fastForward()
 
     /**
-     * @return true if the audio track was changed
+     * @param callback called if track selection was successful and UI needs to be updated
      */
-    fun onAudioTrackSelected(index: Int): Boolean {
-        return viewModel.selectAudioTrack(index)
+    fun onAudioTrackSelected(index: Int, callback: TrackSelectionCallback): Job = lifecycleScope.launch {
+        if (viewModel.trackSelectionHelper.selectAudioTrack(index)) {
+            callback.onTrackSelected(true)
+        }
     }
 
     /**
-     * @return true if the subtitle was changed
+     * @param callback called if track selection was successful and UI needs to be updated
      */
-    fun onSubtitleSelected(index: Int): Boolean {
-        return viewModel.selectSubtitle(index)
+    fun onSubtitleSelected(index: Int, callback: TrackSelectionCallback): Job = lifecycleScope.launch {
+        if (viewModel.trackSelectionHelper.selectSubtitleTrack(index)) {
+            callback.onTrackSelected(true)
+        }
     }
 
     /**
@@ -266,12 +273,12 @@ class PlayerFragment : Fragment() {
      *
      * @return true if subtitles are enabled now, false if not
      */
-    fun toggleSubtitles(): Boolean {
-        return viewModel.mediaQueueManager.toggleSubtitles()
+    fun toggleSubtitles(callback: TrackSelectionCallback) = lifecycleScope.launch {
+        callback.onTrackSelected(viewModel.trackSelectionHelper.toggleSubtitles())
     }
 
-    fun onBitrateChanged(bitrate: Int?) {
-        viewModel.changeBitrate(bitrate)
+    fun onBitrateChanged(bitrate: Int?, callback: TrackSelectionCallback) = lifecycleScope.launch {
+        callback.onTrackSelected(viewModel.changeBitrate(bitrate))
     }
 
     /**
@@ -279,6 +286,10 @@ class PlayerFragment : Fragment() {
      */
     fun onSpeedSelected(speed: Float): Boolean {
         return viewModel.setPlaybackSpeed(speed)
+    }
+
+    fun onDecoderSelected(type: DecoderType) {
+        viewModel.updateDecoderType(type)
     }
 
     fun onSkipToPrevious() {
@@ -359,7 +370,7 @@ class PlayerFragment : Fragment() {
         with(requireActivity()) {
             // Reset screen orientation
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            disableFullscreen()
+            playerFullscreenHelper.disableFullscreen()
             // Reset screen brightness
             window.brightness = BRIGHTNESS_OVERRIDE_NONE
         }

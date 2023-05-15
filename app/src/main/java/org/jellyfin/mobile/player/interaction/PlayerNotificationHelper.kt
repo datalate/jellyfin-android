@@ -10,7 +10,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.os.Build
-import androidx.annotation.StringRes
 import androidx.core.content.getSystemService
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.viewModelScope
@@ -25,6 +24,7 @@ import org.jellyfin.mobile.MainActivity
 import org.jellyfin.mobile.R
 import org.jellyfin.mobile.app.AppPreferences
 import org.jellyfin.mobile.player.PlayerViewModel
+import org.jellyfin.mobile.player.source.JellyfinMediaSource
 import org.jellyfin.mobile.utils.Constants
 import org.jellyfin.mobile.utils.Constants.VIDEO_PLAYER_NOTIFICATION_ID
 import org.jellyfin.mobile.utils.createMediaNotificationChannel
@@ -48,12 +48,27 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
     val allowBackgroundAudio: Boolean
         get() = appPreferences.exoPlayerAllowBackgroundAudio
 
-    @Suppress("DEPRECATION", "LongMethod")
+    private val notificationActionReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Constants.ACTION_PLAY -> viewModel.play()
+                Constants.ACTION_PAUSE -> viewModel.pause()
+                Constants.ACTION_REWIND -> viewModel.rewind()
+                Constants.ACTION_FAST_FORWARD -> viewModel.fastForward()
+                Constants.ACTION_PREVIOUS -> viewModel.skipToPrevious()
+                Constants.ACTION_NEXT -> viewModel.skipToNext()
+                Constants.ACTION_STOP -> viewModel.stop()
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
     fun postNotification() {
         val nm = notificationManager ?: return
         val player = viewModel.playerOrNull ?: return
-        val queueItem = viewModel.mediaQueueManager.mediaQueue.value ?: return
-        val mediaSource = queueItem.jellyfinMediaSource
+        val currentMediaSource = viewModel.queueManager.currentMediaSourceOrNull ?: return
+        val hasPrevious = viewModel.queueManager.hasPrevious()
+        val hasNext = viewModel.queueManager.hasNext()
         val playbackState = player.playbackState
         if (playbackState != Player.STATE_READY && playbackState != Player.STATE_BUFFERING) return
 
@@ -62,15 +77,7 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
 
         viewModel.viewModelScope.launch {
             val mediaIcon: Bitmap? = withContext(Dispatchers.IO) {
-                val size = context.resources.getDimensionPixelSize(R.dimen.media_notification_height)
-
-                val imageUrl = imageApi.getItemImageUrl(
-                    itemId = mediaSource.itemId,
-                    imageType = ImageType.PRIMARY,
-                    maxWidth = size,
-                    maxHeight = size,
-                )
-                imageLoader.execute(ImageRequest.Builder(context).data(imageUrl).build()).drawable?.toBitmap()
+                loadImage(currentMediaSource)
             }
 
             val style = Notification.MediaStyle().apply {
@@ -87,24 +94,22 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
                 }
                 setSmallIcon(R.drawable.ic_notification)
                 mediaIcon?.let(::setLargeIcon)
-                setContentTitle(mediaSource.name)
-                mediaSource.item?.artists?.joinToString()?.let(::setContentText)
+                setContentTitle(currentMediaSource.name)
+                currentMediaSource.item?.artists?.joinToString()?.let(::setContentText)
                 setStyle(style)
                 setVisibility(Notification.VISIBILITY_PUBLIC)
-                if (queueItem.hasPrevious()) {
-                    addAction(generateAction(R.drawable.ic_skip_previous_black_32dp, R.string.notification_action_previous, Constants.ACTION_PREVIOUS))
-                } else {
-                    addAction(generateAction(R.drawable.ic_rewind_black_32dp, R.string.notification_action_rewind, Constants.ACTION_REWIND))
+                when {
+                    hasPrevious -> addAction(generateAction(PlayerNotificationAction.PREVIOUS))
+                    else -> addAction(generateAction(PlayerNotificationAction.REWIND))
                 }
                 val playbackAction = when {
-                    !player.playWhenReady -> generateAction(R.drawable.ic_play_black_42dp, R.string.notification_action_play, Constants.ACTION_PLAY)
-                    else -> generateAction(R.drawable.ic_pause_black_42dp, R.string.notification_action_pause, Constants.ACTION_PAUSE)
+                    !player.playWhenReady -> PlayerNotificationAction.PLAY
+                    else -> PlayerNotificationAction.PAUSE
                 }
-                addAction(playbackAction)
-                if (queueItem.hasNext()) {
-                    addAction(generateAction(R.drawable.ic_skip_next_black_32dp, R.string.notification_action_next, Constants.ACTION_NEXT))
-                } else {
-                    addAction(generateAction(R.drawable.ic_fast_forward_black_32dp, R.string.notification_action_fast_forward, Constants.ACTION_FAST_FORWARD))
+                addAction(generateAction(playbackAction))
+                when {
+                    hasNext -> addAction(generateAction(PlayerNotificationAction.NEXT))
+                    else -> addAction(generateAction(PlayerNotificationAction.FAST_FORWARD))
                 }
                 setContentIntent(buildContentIntent())
                 setDeleteIntent(buildDeleteIntent())
@@ -114,34 +119,45 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
         }
 
         if (receiverRegistered.compareAndSet(false, true)) {
-            context.registerReceiver(
-                notificationActionReceiver,
-                IntentFilter().apply {
-                    addAction(Constants.ACTION_PLAY)
-                    addAction(Constants.ACTION_PAUSE)
-                    addAction(Constants.ACTION_REWIND)
-                    addAction(Constants.ACTION_FAST_FORWARD)
-                    addAction(Constants.ACTION_PREVIOUS)
-                    addAction(Constants.ACTION_NEXT)
-                    addAction(Constants.ACTION_STOP)
-                },
-            )
+            val filter = IntentFilter()
+            for (notificationAction in PlayerNotificationAction.values()) {
+                filter.addAction(notificationAction.action)
+            }
+            context.registerReceiver(notificationActionReceiver, filter)
         }
     }
 
     fun dismissNotification() {
         notificationManager?.cancel(VIDEO_PLAYER_NOTIFICATION_ID)
-        if (receiverRegistered.compareAndSet(true, false))
+        if (receiverRegistered.compareAndSet(true, false)) {
             context.unregisterReceiver(notificationActionReceiver)
+        }
     }
 
-    private fun generateAction(icon: Int, @StringRes title: Int, intentAction: String): Notification.Action {
-        val intent = Intent(intentAction).apply {
+    private suspend fun loadImage(mediaSource: JellyfinMediaSource): Bitmap? {
+        val size = context.resources.getDimensionPixelSize(R.dimen.media_notification_height)
+
+        val imageUrl = imageApi.getItemImageUrl(
+            itemId = mediaSource.itemId,
+            imageType = ImageType.PRIMARY,
+            maxWidth = size,
+            maxHeight = size,
+        )
+        val imageRequest = ImageRequest.Builder(context).data(imageUrl).build()
+        return imageLoader.execute(imageRequest).drawable?.toBitmap()
+    }
+
+    private fun generateAction(playerNotificationAction: PlayerNotificationAction): Notification.Action {
+        val intent = Intent(playerNotificationAction.action).apply {
             `package` = BuildConfig.APPLICATION_ID
         }
         val pendingIntent = PendingIntent.getBroadcast(context, 0, intent, Constants.PENDING_INTENT_FLAGS)
         @Suppress("DEPRECATION")
-        return Notification.Action.Builder(icon, context.getString(title), pendingIntent).build()
+        return Notification.Action.Builder(
+            playerNotificationAction.icon,
+            context.getString(playerNotificationAction.label),
+            pendingIntent,
+        ).build()
     }
 
     private fun buildContentIntent(): PendingIntent {
@@ -152,23 +168,9 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
     }
 
     private fun buildDeleteIntent(): PendingIntent {
-        val intent = Intent(Constants.ACTION_PAUSE).apply {
+        val intent = Intent(Constants.ACTION_STOP).apply {
             `package` = BuildConfig.APPLICATION_ID
         }
         return PendingIntent.getBroadcast(context, 0, intent, Constants.PENDING_INTENT_FLAGS)
-    }
-
-    private val notificationActionReceiver: BroadcastReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                Constants.ACTION_PLAY -> viewModel.play()
-                Constants.ACTION_PAUSE -> viewModel.pause()
-                Constants.ACTION_REWIND -> viewModel.rewind()
-                Constants.ACTION_FAST_FORWARD -> viewModel.fastForward()
-                Constants.ACTION_PREVIOUS -> viewModel.skipToPrevious()
-                Constants.ACTION_NEXT -> viewModel.skipToNext()
-                Constants.ACTION_STOP -> viewModel.stop()
-            }
-        }
     }
 }

@@ -66,14 +66,14 @@
     <string name="media_service_car_section_songs">الأغاني</string>
     <string name="media_service_car_section_artists">الفنانين</string>
     <string name="media_service_car_section_albums">الألبومات</string>
-    <string name="media_service_car_section_recents">تم تشغيله مؤخرًا</string>
+    <string name="media_service_car_section_recents">شُغلت مؤخرا</string>
     <string name="media_service_item_not_found">تعذر العثور على الوسائط</string>
     <string name="media_service_generic_error">حدث خطأ</string>
     <string name="download_no_storage_permission">لا يمكن تحميل الملفات بدون صلاحيات التخزين</string>
     <string name="downloading">جاري التحميل</string>
     <string name="mobile_data_and_roaming">بيانات الهاتف والتجوال</string>
     <string name="mobile_data">بيانات الهاتف</string>
-    <string name="network_message">هل تريد السماح بالتحميل عبر بيانات الهاتف أو شبكات التجوال؟ قد يتم تطبيق رسوم من مزودك.</string>
+    <string name="network_message">هل تريد السماح بالتحميل عبر بيانات الهاتف أو شبكات التجوال؟ قد تُضاف رسوما إضافية من مزودك.</string>
     <string name="wifi_only">واي فاي فقط</string>
     <string name="network_title">أنواع الشبكات المسموحة</string>
     <string name="battery_optimizations_message">يرجى تعطيل تحسين البطارية لتشغيل الوسائط عندما تكون الشاشة منطفئة.</string>
@@ -101,4 +101,11 @@
     <string name="pref_exoplayer_direct_play_ass_summary">منع تحويل الشفرة وإظهار الترجمات مع النمط الأساسي فقط. لن يكون نمط الترجمة المتقدم متاحًا إذا تم تمكينه.</string>
     <string name="pref_exoplayer_direct_play_ass">السماح بترجمات SSA / ASS في التشغيل المباشر</string>
     <string name="menu_item_auto">تلقاءي</string>
+    <string name="button_use_different_server">استخدم خادم آخر</string>
+    <string name="player_error_unspecific_exception">حدث خطأ مع المشغل</string>
+    <string name="menu_item_hardware_decoding">يفك الترميز باستخدام كرت الشاشة</string>
+    <string name="menu_item_software_decoding">يفك الترميز باستخدام المعالج</string>
+    <string name="pref_exoplayer_start_landscape_video_in_landscape">استخدم الوضع العرضي في الشاشة أثناء المقطع عندما تكون الشاشة على وضع الأفقي</string>
+    <string name="pref_subtitle_style">تعديل كيفية ظهور الترجمة</string>
+    <string name="pref_subtitle_style_summary">بإمكان تغيير إعدادات كيفية ظهور الترجمة في إعدادات الـ Android</string>
 </resources>
